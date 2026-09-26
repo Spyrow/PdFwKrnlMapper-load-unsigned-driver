@@ -1,6 +1,7 @@
 #pragma once
 #include <Windows.h>
 #include <Winternl.h>
+#include <iostream>
 #include <string>
 #include <fstream>
 #include <filesystem>
@@ -9,6 +10,10 @@
 #pragma comment(lib, "ntdll.lib")
 using nt_load_driver_t = NTSTATUS(__fastcall*)(PUNICODE_STRING);
 using nt_unload_driver_t = NTSTATUS(__fastcall*)(PUNICODE_STRING);
+
+#ifndef STATUS_SUCCESS
+#define STATUS_SUCCESS ((NTSTATUS)0)
+#endif
 
 namespace driver
 {
@@ -28,20 +33,23 @@ namespace driver
 			return ERROR_SUCCESS == RegDeleteKeyA(reg_handle, service_name.data()) && ERROR_SUCCESS == RegCloseKey(reg_handle);;
 		}
 
-		inline bool create_service_entry(const std::string& drv_path, const std::string& service_name)
+inline bool create_service_entry(const std::string& drv_path, const std::string& service_name)
 		{
 			HKEY reg_handle;
 			std::string reg_key(E("System\\CurrentControlSet\\Services\\"));
 			reg_key += service_name;
 
-			auto result = RegCreateKeyA(
+			DWORD result = RegCreateKeyA(
 				HKEY_LOCAL_MACHINE,
 				reg_key.c_str(),
 				&reg_handle
 			);
 
 			if (result != ERROR_SUCCESS)
+			{
+				std::cout << " [Loadup] RegCreateKey failed: " << result << " (key: " << reg_key << ")" << std::endl;
 				return false;
+			}
 
 			//
 			// set type to 1 (kernel)
@@ -109,16 +117,21 @@ namespace driver
 			return ERROR_SUCCESS == RegCloseKey(reg_handle);
 		}
 
-		// this function was coded by paracord: https://githacks.org/snippets/4#L94 
-		inline bool enable_privilege(const std::string& privilege_name)
+inline bool enable_privilege(const std::string& privilege_name)
 		{
 			HANDLE token_handle = nullptr;
 			if (!OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &token_handle))
+			{
+				std::cout << " [Loadup] OpenProcessToken failed: " << GetLastError() << std::endl;
 				return false;
+			}
 
 			LUID luid{};
 			if (!LookupPrivilegeValueA(nullptr, privilege_name.data(), &luid))
+			{
+				std::cout << " [Loadup] LookupPrivilegeValueA failed: " << GetLastError() << std::endl;
 				return false;
+			}
 
 			TOKEN_PRIVILEGES token_state{};
 			token_state.PrivilegeCount = 1;
@@ -126,7 +139,12 @@ namespace driver
 			token_state.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
 
 			if (!AdjustTokenPrivileges(token_handle, FALSE, &token_state, sizeof(TOKEN_PRIVILEGES), nullptr, nullptr))
+			{
+				std::cout << " [Loadup] AdjustTokenPrivileges failed: " << GetLastError() << std::endl;
 				return false;
+			}
+
+			std::cout << " [Loadup] Privilege " << privilege_name << " enabled successfully" << std::endl;
 
 			CloseHandle(token_handle);
 			return true;
@@ -163,10 +181,18 @@ namespace driver
 	inline NTSTATUS load(const std::string& drv_path, const std::string& service_name)
 	{
 		if (!util::enable_privilege(std::string(E("SeLoadDriverPrivilege"))))
+		{
+			std::cout << " [Loadup] Failed to enable SeLoadDriverPrivilege" << std::endl;
 			return STATUS_ABANDONED_WAIT_0;
+		}
 
-		if (!util::create_service_entry("\\??\\" + std::filesystem::absolute(std::filesystem::path(drv_path)).string(), service_name))
+		std::string drv_path_full = "\\??\\" + std::filesystem::absolute(std::filesystem::path(drv_path)).string();
+		std::cout << " [Loadup] Creating service entry for: " << drv_path_full << std::endl;
+		if (!util::create_service_entry(drv_path_full, service_name))
+		{
+			std::cout << " [Loadup] create_service_entry failed for: " << service_name << std::endl;
 			return STATUS_ABANDONED_WAIT_0;
+		}
 
 		std::string reg_path(E("\\Registry\\Machine\\System\\CurrentControlSet\\Services\\"));
 		reg_path += service_name;
@@ -184,7 +210,20 @@ namespace driver
 
 			RtlInitAnsiString(&driver_rep_path_cstr, reg_path.c_str());
 			RtlAnsiStringToUnicodeString(&driver_reg_path_unicode, &driver_rep_path_cstr, true);
-			reinterpret_cast<nt_load_driver_t>(lp_nt_load_drv)(&driver_reg_path_unicode);
+
+			std::cout << " [Loadup] NtLoadDriver called for: " << service_name << std::endl;
+			NTSTATUS status = reinterpret_cast<nt_load_driver_t>(lp_nt_load_drv)(&driver_reg_path_unicode);
+			std::cout << " [Loadup] NtLoadDriver returned: 0x" << std::hex << std::uppercase << status << std::dec << std::endl;
+
+			RtlFreeUnicodeString(&driver_reg_path_unicode);
+
+			if (status != STATUS_SUCCESS)
+			{
+				std::cout << " [Loadup] Attempting to delete service: " << service_name << std::endl;
+				util::delete_service_entry(service_name);
+			}
+
+			return status;
 		}
 
 		return STATUS_ABANDONED_WAIT_0;
